@@ -2138,7 +2138,7 @@ function New-ConsolidatedHtmlReport {
                         $allFindings.Add($f) | Out-Null
                     }
 
-                    Write-Log "Parsed $toolName: $($findings.Count) findings, $($unparsedLines.Count) unclassified lines"
+                    Write-Log "Parsed ${toolName}: $($findings.Count) findings, $($unparsedLines.Count) unclassified lines"
                 } catch {
                     Write-Log "Failed to parse $toolName output: $($_.Exception.Message)" -Level "WARN"
                     $allFindings.Add(@{
@@ -2539,45 +2539,45 @@ try {
 
 } finally {
     # Phase 4: Cleanup (ALWAYS runs, even on Ctrl+C)
-    $Script:CurrentPhase = "CLEANUP"
-
     # Skip cleanup if we were in cleaner mode (already handled)
-    if ($Clean) { return }
+    if (-not $Clean) {
+        $Script:CurrentPhase = "CLEANUP"
 
-    Write-Host ""
-    if (-not $Script:ScriptCompleted) {
-        Write-Host "  Script interrupted/failed - performing emergency cleanup..." -ForegroundColor Red
-    } else {
-        Write-Host "  Performing cleanup..." -ForegroundColor DarkGray
-    }
-
-    # Remove downloaded tools (temp bat files etc.)
-    Remove-ReconTools
-
-    # If script didn't complete, also remove partial output
-    if (-not $Script:ScriptCompleted) {
-        Remove-PartialOutput
-    }
-
-    # Remove forensic traces
-    $cleanupResults = Remove-ForensicTraces
-
-    # Show cleanup report
-    Show-CleanupReport -CleanupResults $cleanupResults
-
-    if ($Script:ScriptCompleted) {
-        Write-Host "  Recon complete. Results saved to:" -ForegroundColor Green
-        Write-Host "  $($Script:OutputDir)" -ForegroundColor Cyan
-    } else {
-        if ($Script:OutputDir -and (Test-Path $Script:OutputDir -ErrorAction SilentlyContinue)) {
-            Write-Host "  Partial results may be at:" -ForegroundColor Yellow
-            Write-Host "  $($Script:OutputDir)" -ForegroundColor Yellow
+        Write-Host ""
+        if (-not $Script:ScriptCompleted) {
+            Write-Host "  Script interrupted/failed - performing emergency cleanup..." -ForegroundColor Red
         } else {
-            Write-Host "  No output saved (cleaned up partial data)." -ForegroundColor Yellow
+            Write-Host "  Performing cleanup..." -ForegroundColor DarkGray
+        }
+
+        # Remove downloaded tools (temp bat files etc.)
+        Remove-ReconTools
+
+        # If script didn't complete, also remove partial output
+        if (-not $Script:ScriptCompleted) {
+            Remove-PartialOutput
+        }
+
+        # Remove forensic traces
+        $cleanupResults = Remove-ForensicTraces
+
+        # Show cleanup report
+        Show-CleanupReport -CleanupResults $cleanupResults
+
+        if ($Script:ScriptCompleted) {
+            Write-Host "  Recon complete. Results saved to:" -ForegroundColor Green
+            Write-Host "  $($Script:OutputDir)" -ForegroundColor Cyan
+        } else {
+            if ($Script:OutputDir -and (Test-Path $Script:OutputDir -ErrorAction SilentlyContinue)) {
+                Write-Host "  Partial results may be at:" -ForegroundColor Yellow
+                Write-Host "  $($Script:OutputDir)" -ForegroundColor Yellow
+            } else {
+                Write-Host "  No output saved (cleaned up partial data)." -ForegroundColor Yellow
+            }
+            Write-Host ""
+            Write-Host "  To clean any remaining traces, run:" -ForegroundColor DarkGray
+            Write-Host "  .\Invoke-WindowsRecon.ps1 -Clean" -ForegroundColor Cyan
         }
         Write-Host ""
-        Write-Host "  To clean any remaining traces, run:" -ForegroundColor DarkGray
-        Write-Host "  .\Invoke-WindowsRecon.ps1 -Clean" -ForegroundColor Cyan
     }
-    Write-Host ""
 }
