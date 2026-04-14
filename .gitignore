@@ -1,0 +1,27 @@
+# Tool binaries
+*.exe
+*.dll
+
+# Output folders
+ReconResults/
+Output/
+Results/
+
+# Temp files
+*.tmp
+*.bak
+*.log
+
+# PowerShell artifacts
+ConsoleHost_history.txt
+
+# OS artifacts
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.suo
+*.user
