@@ -79,7 +79,7 @@ $ToolSource = "url"    # "url" = download from GitHub, "local" = copy from SMB/f
 ### Output Directory
 
 ```powershell
-$OutputBaseDir = "$env:USERPROFILE\Desktop\ReconResults"
+$OutputBaseDir = "$env:TEMP\ReconResults"   # Default: temp dir (nothing on Desktop)
 ```
 
 ### Timeout
@@ -145,8 +145,10 @@ For `ps1` tools that require specific invocation (like calling a function after 
 
 ## Output Structure
 
+Results are saved to a **temp directory** — nothing is written to Desktop or user-visible folders:
+
 ```
-Desktop\ReconResults\Recon_20260414_153022\
+%TEMP%\ReconResults\Recon_20260414_153022\
     recon-report.html          # Consolidated HTML report (THE file to download)
     recon-log.txt              # Detailed execution log
     WinPEAS-output.txt         # WinPEAS findings
@@ -157,6 +159,12 @@ Desktop\ReconResults\Recon_20260414_153022\
     Powerless-output.txt       # Powerless findings
     PrivescCheck-output.txt    # PrivescCheck findings
     summary.txt                # Quick overview with tool statuses and timing
+```
+
+The exact path is printed at the end of execution. To copy the HTML report off the machine via SCP:
+
+```bash
+scp admin@TARGET:%TEMP%/ReconResults/Recon_*/recon-report.html ./
 ```
 
 Only the results folder remains after execution. All tools and temporary files are cleaned up.

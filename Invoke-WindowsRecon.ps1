@@ -47,8 +47,8 @@ if ($env:RECON_STEALTH -eq '1') { $Stealth = [switch]::Present }
 # Tool source: "url" downloads from GitHub, "local" copies from SMB/file path
 $ToolSource = "url"
 
-# Base output directory for recon results
-$OutputBaseDir = "$env:USERPROFILE\Desktop\ReconResults"
+# Base output directory for recon results (uses temp dir — nothing on Desktop)
+$OutputBaseDir = "$env:TEMP\ReconResults"
 
 # Timeout per tool execution (seconds)
 $TimeoutSeconds = 600
