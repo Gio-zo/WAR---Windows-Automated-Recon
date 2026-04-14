@@ -26,7 +26,7 @@ Automated vulnerability enumeration and misconfiguration detection for Windows m
 SSH into the target machine, open an **elevated PowerShell** prompt, and paste:
 
 ```powershell
-powershell -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1')"
+powershell -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/Gio-zo/WAR---Windows-Automated-Recon/refs/heads/main/Invoke-WindowsRecon.ps1')"
 ```
 
 > Replace `YOUR_USER` with your GitHub username (or use the full raw URL to your repo).
@@ -39,7 +39,7 @@ If you want to review/edit the config before running:
 
 ```powershell
 # Download script to current directory
-(New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1', '.\Invoke-WindowsRecon.ps1')
+(New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/Gio-zo/WAR---Windows-Automated-Recon/refs/heads/main/Invoke-WindowsRecon.ps1', '.\Invoke-WindowsRecon.ps1')
 
 # Edit config if needed, then run
 powershell -ep bypass -f .\Invoke-WindowsRecon.ps1
@@ -51,7 +51,7 @@ If a previous run was interrupted or you want to nuke everything:
 
 ```powershell
 # Via IEX (one-liner):
-powershell -ep bypass -c "$env:RECON_CLEAN='1'; IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1')"
+powershell -ep bypass -c "$env:RECON_CLEAN='1'; IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/Gio-zo/WAR---Windows-Automated-Recon/refs/heads/main/Invoke-WindowsRecon.ps1')"
 
 # From a local copy:
 powershell -ep bypass -f .\Invoke-WindowsRecon.ps1 -Clean
