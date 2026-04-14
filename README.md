@@ -45,6 +45,20 @@ If you want to review/edit the config before running:
 powershell -ep bypass -f .\Invoke-WindowsRecon.ps1
 ```
 
+### Cleaner mode (remove all traces)
+
+If a previous run was interrupted or you want to nuke everything:
+
+```powershell
+# Via IEX (one-liner):
+powershell -ep bypass -c "$env:RECON_CLEAN='1'; IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1')"
+
+# From a local copy:
+powershell -ep bypass -f .\Invoke-WindowsRecon.ps1 -Clean
+```
+
+This skips all recon and only cleans: output directories, temp files, Prefetch entries, PowerShell history, event logs, Defender history, Zone.Identifier ADS, Recent Items, and .NET assembly cache.
+
 ### From a local copy
 
 ```powershell
