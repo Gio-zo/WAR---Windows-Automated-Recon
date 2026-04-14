@@ -9,6 +9,7 @@ Automated vulnerability enumeration and misconfiguration detection for Windows m
 - Full forensic cleanup after execution
 - Live dashboard with progress tracking
 - Skip-on-failure design — one tool failing never stops the others
+- **Consolidated HTML report** — single downloadable file with color-coded findings, interactive filters, and full raw output
 
 ## Prerequisites
 
@@ -20,16 +21,34 @@ Automated vulnerability enumeration and misconfiguration detection for Windows m
 
 ## Quick Start
 
+### One-liner (no git required)
+
+SSH into the target machine, open an **elevated PowerShell** prompt, and paste:
+
 ```powershell
-# From an elevated PowerShell prompt:
-powershell.exe -ExecutionPolicy Bypass -File .\Invoke-WindowsRecon.ps1
+powershell -ep bypass -c "IEX(New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1')"
 ```
 
-Or from an existing elevated session:
+> Replace `YOUR_USER` with your GitHub username (or use the full raw URL to your repo).
+
+That's it — downloads the script to memory and runs it. No git, no files cloned, no installation.
+
+### Alternative: download then run
+
+If you want to review/edit the config before running:
 
 ```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-.\Invoke-WindowsRecon.ps1
+# Download script to current directory
+(New-Object Net.WebClient).DownloadFile('https://raw.githubusercontent.com/YOUR_USER/windows-automated-recon/main/Invoke-WindowsRecon.ps1', '.\Invoke-WindowsRecon.ps1')
+
+# Edit config if needed, then run
+powershell -ep bypass -f .\Invoke-WindowsRecon.ps1
+```
+
+### From a local copy
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\Invoke-WindowsRecon.ps1
 ```
 
 ## Configuration
@@ -113,6 +132,7 @@ For `ps1` tools that require specific invocation (like calling a function after 
 
 ```
 Desktop\ReconResults\Recon_20260414_153022\
+    recon-report.html          # Consolidated HTML report (THE file to download)
     recon-log.txt              # Detailed execution log
     WinPEAS-output.txt         # WinPEAS findings
     Seatbelt-output.txt        # Seatbelt findings
@@ -125,6 +145,40 @@ Desktop\ReconResults\Recon_20260414_153022\
 ```
 
 Only the results folder remains after execution. All tools and temporary files are cleaned up.
+
+## Consolidated HTML Report
+
+The `recon-report.html` is a **single self-contained file** (no external dependencies) that you download from the target machine and open in any browser for offline analysis.
+
+### What's in the report
+
+- **Stats dashboard** — Donut chart and count cards showing findings by severity (Critical/High/Medium/Low/Info)
+- **Executive summary** — Top 10 most critical findings at a glance
+- **All findings** — Every finding from every tool, sorted by severity, in expandable cards
+- **Interactive filters** — Toggle severity levels, filter by tool, free-text search
+- **Cross-tool deduplication** — Badges showing when multiple tools found the same issue
+- **Full raw output** — Collapsible sections with complete unprocessed output from each tool
+
+### How severity is assigned
+
+- **PrivescCheck**: Uses native severity levels directly (Info/Low/Medium/High), escalated to CRITICAL via keyword matching
+- **SharpUp / PowerUp**: `[+]` findings (actual vulnerabilities found) are classified as HIGH
+- **All tools**: Keyword-based classification scans for patterns like:
+  - CRITICAL: passwords, credentials, cleartext, token impersonation, SeImpersonatePrivilege
+  - HIGH: writable/modifiable services, unquoted service paths, DLL hijacking, AlwaysInstallElevated
+  - MEDIUM: missing patches, firewall disabled, UAC disabled, guest account enabled
+  - LOW: listening ports, scheduled tasks, installed software
+
+### Nothing is missed
+
+The report uses a **line coverage safety net**: after parsing each tool's output, any lines that weren't captured by the parser are included as "Unclassified" findings. The full raw output of every tool is always preserved in collapsible sections at the bottom.
+
+### Configuration
+
+```powershell
+$GenerateHtmlReport = $true          # Enable/disable HTML report generation
+$HtmlReportFileName = "recon-report.html"  # Output filename
+```
 
 ## EDR Evasion Techniques
 

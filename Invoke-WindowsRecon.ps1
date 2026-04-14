@@ -33,6 +33,12 @@ $OutputBaseDir = "$env:USERPROFILE\Desktop\ReconResults"
 # Timeout per tool execution (seconds)
 $TimeoutSeconds = 600
 
+# Generate consolidated HTML report with color-coded findings after tool execution
+$GenerateHtmlReport = $true
+
+# HTML report filename (inside the output directory)
+$HtmlReportFileName = "recon-report.html"
+
 # Tool configuration array
 $ToolConfig = @(
     @{
@@ -1006,6 +1012,945 @@ function Show-CleanupReport {
 }
 
 # ============================================================================
+# SECTION I-B: HTML REPORT GENERATION
+# ============================================================================
+
+function ConvertTo-HtmlSafe {
+    param([string]$Text)
+    if (-not $Text) { return "" }
+    $cleaned = $Text -replace '\x1B\[[0-9;]*[a-zA-Z]', ''
+    $cleaned = $cleaned -replace '[\x00-\x08\x0B\x0C\x0E-\x1F]', ''
+    return [System.Net.WebUtility]::HtmlEncode($cleaned)
+}
+
+function Get-SeverityFromKeywords {
+    param([string]$Text)
+    if (-not $Text) { return "INFO" }
+
+    $patterns = @(
+        @{ Sev = "CRITICAL"; Rx = @(
+            'password\s*[:=]', 'cleartext.*password', 'plaintext.*password',
+            'autologon', 'cpassword', 'unattend\.xml.*password',
+            'vnc.*password', 'snmp.*community', 'DefaultPassword',
+            'token.*impersonat', 'SeImpersonatePrivilege',
+            'SeAssignPrimaryTokenPrivilege', 'SeDebugPrivilege',
+            'credential\s*manager', 'dpapi.*master.*key',
+            'passwords?\s*found', 'credentials?\s*found',
+            'registry.*password', 'cached.*credential'
+        )},
+        @{ Sev = "HIGH"; Rx = @(
+            'writable', 'modifiable', 'unquoted.*service.*path',
+            'service.*unquoted', 'dll\s*hijack', 'alwaysinstallelevated',
+            'weak\s*permission', 'everyone.*(full|modify|write)',
+            'builtin\\users.*(write|modify|full)',
+            'authenticated\s*users.*(modify|full)',
+            'service.*binary.*path.*space', 'autorun.*modifiable',
+            'ms\d{2}-\d{3}', 'exploit', 'vulnerable\s*to',
+            'abuse\s*function', 'can\s*be\s*exploited',
+            'hijackable', 'dll.*not.*found'
+        )},
+        @{ Sev = "MEDIUM"; Rx = @(
+            'missing.*patch', 'firewall.*disabled', 'no\s*antivirus',
+            'outdated', 'defender.*disabled', 'uac.*disabled',
+            'audit.*disabled', 'guest.*enabled', 'anonymous.*logon',
+            'null.*session', 'smb.*signing.*disabled',
+            'rdp.*no.*nla', 'world.*readable', 'weak.*config',
+            'no.*updates', 'laps.*not'
+        )},
+        @{ Sev = "LOW"; Rx = @(
+            'listening.*port', 'scheduled.*task', 'network.*interface',
+            'installed.*software', 'local.*group.*member',
+            'environment.*variable', 'mapped.*drive', 'share\s*name'
+        )}
+    )
+
+    $lower = $Text.ToLower()
+    foreach ($group in $patterns) {
+        foreach ($rx in $group.Rx) {
+            if ($lower -match $rx) {
+                return $group.Sev
+            }
+        }
+    }
+    return "INFO"
+}
+
+# --- Per-Tool Parsers ---
+
+function ConvertFrom-WinPEASOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $lines = $RawOutput -split "`n"
+    $currentSection = "General"
+    $blockLines = [System.Collections.ArrayList]::new()
+
+    $flushBlock = {
+        if ($blockLines.Count -gt 0) {
+            $blockText = $blockLines -join "`n"
+            $sev = Get-SeverityFromKeywords -Text $blockText
+            $t = ($blockLines[0]).Trim()
+            if ($t.Length -gt 120) { $t = $t.Substring(0, 120) + "..." }
+            $findings.Add(@{
+                Tool = "WinPEAS"; Category = $currentSection; Severity = $sev
+                Title = $t; Details = $blockText; RawLines = [string[]]@($blockLines)
+            }) | Out-Null
+            $blockLines.Clear()
+        }
+    }
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $line = $lines[$i].TrimEnd()
+
+        if ($line -match '[╔═╗╚╝╠╣║]{3,}[╣║]\s*(.+)') {
+            & $flushBlock
+            $currentSection = $Matches[1].Trim()
+            continue
+        }
+
+        if ($line -match '^[\s═╔╗╚╝╠╣║▌▐─━\-=]{5,}$') {
+            & $flushBlock
+            if (($i + 1) -lt $lines.Count -and $lines[$i+1].Trim().Length -gt 2 -and $lines[$i+1] -notmatch '^[\s═╔╗╚╝╠╣║▌▐─━\-=]{5,}$') {
+                $currentSection = $lines[$i+1].Trim()
+            }
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($line)) {
+            & $flushBlock
+            continue
+        }
+
+        $blockLines.Add($line) | Out-Null
+    }
+    & $flushBlock
+
+    if ($findings.Count -eq 0 -and $RawOutput.Trim().Length -gt 0) {
+        $findings.Add(@{
+            Tool = "WinPEAS"; Category = "Full Output"; Severity = Get-SeverityFromKeywords -Text $RawOutput
+            Title = "WinPEAS Enumeration Results"; Details = $RawOutput.Trim()
+            RawLines = [string[]]@($RawOutput -split "`n")
+        }) | Out-Null
+    }
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-SeatbeltOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $sections = [regex]::Split($RawOutput, '(?m)^={4,}\s*(.+?)\s*={4,}\s*$')
+
+    $categoryMap = @{
+        'Credential|Vault|DPAPI|Token|Kerberos' = 'Credentials'
+        'Service|Process' = 'Services & Processes'
+        'Network|Firewall|DNS|ARP|TCP' = 'Network'
+        'File|Directory|InterestingFile' = 'File System'
+        'Registry|AutoRun' = 'Registry'
+        'User|Group|Logon|Session|RDP' = 'Users & Groups'
+    }
+
+    for ($i = 1; $i -lt $sections.Count - 1; $i += 2) {
+        $checkName = $sections[$i].Trim()
+        $content = if (($i + 1) -lt $sections.Count) { $sections[$i + 1].Trim() } else { "" }
+        if ([string]::IsNullOrWhiteSpace($content)) { continue }
+
+        $category = "System Configuration"
+        foreach ($pattern in $categoryMap.Keys) {
+            if ($checkName -match $pattern) {
+                $category = $categoryMap[$pattern]
+                break
+            }
+        }
+
+        $severity = Get-SeverityFromKeywords -Text "$checkName $content"
+
+        $findings.Add(@{
+            Tool = "Seatbelt"; Category = $category; Severity = $severity
+            Title = $checkName; Details = $content
+            RawLines = [string[]]@($content -split "`n")
+        }) | Out-Null
+    }
+
+    if ($findings.Count -eq 0 -and $RawOutput.Trim().Length -gt 0) {
+        $findings.Add(@{
+            Tool = "Seatbelt"; Category = "Full Output"; Severity = Get-SeverityFromKeywords -Text $RawOutput
+            Title = "Seatbelt Enumeration Results"; Details = $RawOutput.Trim()
+            RawLines = [string[]]@($RawOutput -split "`n")
+        }) | Out-Null
+    }
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-SharpUpOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $lines = $RawOutput -split "`n"
+    $currentCheck = "General"
+    $blockLines = [System.Collections.ArrayList]::new()
+    $hasPositive = $false
+
+    $flushSharpUp = {
+        if ($blockLines.Count -gt 0) {
+            $blockText = $blockLines -join "`n"
+            $sev = if ($hasPositive) { "HIGH" } else { "INFO" }
+            $kwSev = Get-SeverityFromKeywords -Text $blockText
+            $sevOrder = @{ "CRITICAL" = 0; "HIGH" = 1; "MEDIUM" = 2; "LOW" = 3; "INFO" = 4 }
+            if ($sevOrder[$kwSev] -lt $sevOrder[$sev]) { $sev = $kwSev }
+            $findings.Add(@{
+                Tool = "SharpUp"; Category = $currentCheck; Severity = $sev
+                Title = $currentCheck; Details = $blockText
+                RawLines = [string[]]@($blockLines)
+            }) | Out-Null
+            $blockLines.Clear()
+        }
+    }
+
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd()
+        if ($trimmed -match '===\s*SharpUp[:\s]*(.+?)\s*===') {
+            & $flushSharpUp
+            $currentCheck = $Matches[1].Trim()
+            $hasPositive = $false
+            continue
+        }
+        if ($trimmed -match '^\[\+\]') { $hasPositive = $true }
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $blockLines.Add($trimmed) | Out-Null
+        }
+    }
+    & $flushSharpUp
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-JAWSOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $sections = [regex]::Split($RawOutput, '(?m)^-{3,}\s*(.+?)\s*-{3,}\s*$')
+
+    for ($i = 1; $i -lt $sections.Count - 1; $i += 2) {
+        $sectionName = $sections[$i].Trim()
+        $content = if (($i + 1) -lt $sections.Count) { $sections[$i + 1].Trim() } else { "" }
+        if ([string]::IsNullOrWhiteSpace($content)) { continue }
+
+        $severity = Get-SeverityFromKeywords -Text "$sectionName $content"
+
+        $findings.Add(@{
+            Tool = "JAWS"; Category = $sectionName; Severity = $severity
+            Title = $sectionName; Details = $content
+            RawLines = [string[]]@($content -split "`n")
+        }) | Out-Null
+    }
+
+    if ($findings.Count -eq 0 -and $RawOutput.Trim().Length -gt 0) {
+        $findings.Add(@{
+            Tool = "JAWS"; Category = "Full Output"; Severity = Get-SeverityFromKeywords -Text $RawOutput
+            Title = "JAWS Enumeration Results"; Details = $RawOutput.Trim()
+            RawLines = [string[]]@($RawOutput -split "`n")
+        }) | Out-Null
+    }
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-PowerUpOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $lines = $RawOutput -split "`n"
+    $currentCheck = "General"
+    $blockLines = [System.Collections.ArrayList]::new()
+    $hasPositive = $false
+
+    $flushPowerUp = {
+        if ($blockLines.Count -gt 0) {
+            $blockText = $blockLines -join "`n"
+            $sev = if ($hasPositive) { "HIGH" } else { "INFO" }
+            $kwSev = Get-SeverityFromKeywords -Text $blockText
+            $sevOrder = @{ "CRITICAL" = 0; "HIGH" = 1; "MEDIUM" = 2; "LOW" = 3; "INFO" = 4 }
+            if ($sevOrder[$kwSev] -lt $sevOrder[$sev]) { $sev = $kwSev }
+            $findings.Add(@{
+                Tool = "PowerUp"; Category = $currentCheck; Severity = $sev
+                Title = $currentCheck; Details = $blockText
+                RawLines = [string[]]@($blockLines)
+            }) | Out-Null
+            $blockLines.Clear()
+        }
+    }
+
+    foreach ($line in $lines) {
+        $trimmed = $line.TrimEnd()
+        if ($trimmed -match '^\[\*\]\s*Checking\s+(.+)') {
+            & $flushPowerUp
+            $currentCheck = $Matches[1].Trim().TrimEnd('.')
+            $hasPositive = $false
+            continue
+        }
+        if ($trimmed -match '^\[\+\]') { $hasPositive = $true }
+        if (-not [string]::IsNullOrWhiteSpace($trimmed)) {
+            $blockLines.Add($trimmed) | Out-Null
+        }
+    }
+    & $flushPowerUp
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-PowerlessOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $sections = [regex]::Split($RawOutput, '(?m)^-{4,}\s*(.+?)\s*-{4,}\s*$')
+
+    for ($i = 1; $i -lt $sections.Count - 1; $i += 2) {
+        $sectionName = $sections[$i].Trim()
+        $content = if (($i + 1) -lt $sections.Count) { $sections[$i + 1].Trim() } else { "" }
+        if ([string]::IsNullOrWhiteSpace($content)) { continue }
+
+        $severity = Get-SeverityFromKeywords -Text "$sectionName $content"
+
+        $findings.Add(@{
+            Tool = "Powerless"; Category = $sectionName; Severity = $severity
+            Title = $sectionName; Details = $content
+            RawLines = [string[]]@($content -split "`n")
+        }) | Out-Null
+    }
+
+    if ($findings.Count -eq 0 -and $RawOutput.Trim().Length -gt 0) {
+        $findings.Add(@{
+            Tool = "Powerless"; Category = "Full Output"; Severity = Get-SeverityFromKeywords -Text $RawOutput
+            Title = "Powerless Enumeration Results"; Details = $RawOutput.Trim()
+            RawLines = [string[]]@($RawOutput -split "`n")
+        }) | Out-Null
+    }
+
+    return ,$findings.ToArray()
+}
+
+function ConvertFrom-PrivescCheckOutput {
+    param([string]$RawOutput)
+    $findings = [System.Collections.ArrayList]::new()
+    if (-not $RawOutput) { return ,@() }
+
+    $blocks = $RawOutput -split '(?m)^\s*$' | Where-Object { $_.Trim().Length -gt 0 }
+
+    foreach ($block in $blocks) {
+        $blockTrimmed = $block.Trim()
+
+        $nameMatch = [regex]::Match($blockTrimmed, '(?m)^.*?Name\s*:\s*(.+)$')
+        $sevMatch = [regex]::Match($blockTrimmed, '(?mi)^.*?Severity\s*:\s*(.+)$')
+        $descMatch = [regex]::Match($blockTrimmed, '(?m)^.*?Description\s*:\s*(.+)$')
+        $resultMatch = [regex]::Match($blockTrimmed, '(?mi)^.*?Result\s*:\s*(.+)$')
+
+        if ($nameMatch.Success) {
+            $checkName = $nameMatch.Groups[1].Value.Trim()
+
+            $severity = "INFO"
+            if ($sevMatch.Success) {
+                $nativeSev = $sevMatch.Groups[1].Value.Trim()
+                $severity = switch -Regex ($nativeSev) {
+                    '(?i)high'   { "HIGH" }
+                    '(?i)medium' { "MEDIUM" }
+                    '(?i)low'    { "LOW" }
+                    default      { "INFO" }
+                }
+            }
+
+            if ($severity -eq "HIGH") {
+                $kwSev = Get-SeverityFromKeywords -Text $blockTrimmed
+                if ($kwSev -eq "CRITICAL") { $severity = "CRITICAL" }
+            }
+
+            $result = if ($resultMatch.Success) { $resultMatch.Groups[1].Value.Trim() } else { "" }
+            $title = $checkName
+            if ($result -and $result -ne "N/A") { $title += " - $result" }
+            if ($title.Length -gt 120) { $title = $title.Substring(0, 120) + "..." }
+
+            $findings.Add(@{
+                Tool = "PrivescCheck"; Category = $checkName; Severity = $severity
+                Title = $title; Details = $blockTrimmed
+                RawLines = [string[]]@($blockTrimmed -split "`n")
+            }) | Out-Null
+        } elseif ($blockTrimmed.Length -gt 20) {
+            $severity = Get-SeverityFromKeywords -Text $blockTrimmed
+            $firstLine = ($blockTrimmed -split "`n")[0].Trim()
+            if ($firstLine.Length -gt 120) { $firstLine = $firstLine.Substring(0, 120) + "..." }
+            $findings.Add(@{
+                Tool = "PrivescCheck"; Category = "General"; Severity = $severity
+                Title = $firstLine; Details = $blockTrimmed
+                RawLines = [string[]]@($blockTrimmed -split "`n")
+            }) | Out-Null
+        }
+    }
+
+    return ,$findings.ToArray()
+}
+
+# --- Dispatcher ---
+
+function ConvertFrom-ToolOutput {
+    param([string]$ToolName, [string]$RawOutput)
+    if (-not $RawOutput) { return @() }
+
+    $findings = switch ($ToolName) {
+        "WinPEAS"       { ConvertFrom-WinPEASOutput -RawOutput $RawOutput }
+        "Seatbelt"      { ConvertFrom-SeatbeltOutput -RawOutput $RawOutput }
+        "SharpUp"       { ConvertFrom-SharpUpOutput -RawOutput $RawOutput }
+        "JAWS"          { ConvertFrom-JAWSOutput -RawOutput $RawOutput }
+        "PowerUp"       { ConvertFrom-PowerUpOutput -RawOutput $RawOutput }
+        "Powerless"     { ConvertFrom-PowerlessOutput -RawOutput $RawOutput }
+        "PrivescCheck"  { ConvertFrom-PrivescCheckOutput -RawOutput $RawOutput }
+        default {
+            ,@(@{
+                Tool = $ToolName; Category = "Uncategorized"; Severity = "INFO"
+                Title = "$ToolName output"; Details = $RawOutput
+                RawLines = [string[]]@($RawOutput -split "`n")
+            })
+        }
+    }
+
+    if ($null -eq $findings) { return @() }
+    return $findings
+}
+
+# --- Line Coverage Safety Net ---
+
+function Test-FindingLineCoverage {
+    param([string]$RawOutput, [array]$Findings)
+
+    $allLines = $RawOutput -split "`n"
+    $parsedLineSet = [System.Collections.Generic.HashSet[string]]::new(
+        [System.StringComparer]::OrdinalIgnoreCase
+    )
+
+    foreach ($finding in $Findings) {
+        if ($finding.RawLines) {
+            foreach ($rl in $finding.RawLines) {
+                if ($rl) { $parsedLineSet.Add($rl.TrimEnd()) | Out-Null }
+            }
+        }
+    }
+
+    $unparsed = [System.Collections.ArrayList]::new()
+    foreach ($line in $allLines) {
+        $trimmed = $line.TrimEnd()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
+        if ($trimmed -match '^[\s═╔╗╚╝╠╣║▌▐─━\-=\+\|\*]{4,}$') { continue }
+        if (-not $parsedLineSet.Contains($trimmed)) {
+            $unparsed.Add($trimmed) | Out-Null
+        }
+    }
+
+    return ,$unparsed.ToArray()
+}
+
+# --- Cross-Tool Duplicate Detection ---
+
+function Find-DuplicateFindings {
+    param([array]$AllFindings)
+
+    $dupeKeys = @(
+        @{ Key = "unquoted_svc_path"; Patterns = @('unquoted.*service', 'service.*unquoted.*path') },
+        @{ Key = "modifiable_svc"; Patterns = @('modifiable.*service', 'writable.*service', 'service.*permission') },
+        @{ Key = "always_install"; Patterns = @('alwaysinstallelevated') },
+        @{ Key = "dll_hijack"; Patterns = @('dll.*hijack', 'missing.*dll', 'hijackable.*path') },
+        @{ Key = "autorun"; Patterns = @('autorun', 'auto.*run.*modifiable') },
+        @{ Key = "stored_cred"; Patterns = @('stored.*credential', 'credential.*manager', 'vault') },
+        @{ Key = "weak_svc_perm"; Patterns = @('weak.*permission.*service', 'service.*dacl', 'service.*binary.*modifiable') }
+    )
+
+    $findingKeyMap = @{}
+    for ($idx = 0; $idx -lt $AllFindings.Count; $idx++) {
+        $text = "$($AllFindings[$idx].Title) $($AllFindings[$idx].Category)".ToLower()
+        foreach ($dk in $dupeKeys) {
+            foreach ($p in $dk.Patterns) {
+                if ($text -match $p) {
+                    if (-not $findingKeyMap[$idx]) { $findingKeyMap[$idx] = [System.Collections.ArrayList]::new() }
+                    $findingKeyMap[$idx].Add($dk.Key) | Out-Null
+                    break
+                }
+            }
+        }
+    }
+
+    $keyToIndices = @{}
+    foreach ($entry in $findingKeyMap.GetEnumerator()) {
+        foreach ($key in $entry.Value) {
+            if (-not $keyToIndices[$key]) { $keyToIndices[$key] = [System.Collections.ArrayList]::new() }
+            $keyToIndices[$key].Add($entry.Key) | Out-Null
+        }
+    }
+
+    $dupeMap = @{}
+    foreach ($entry in $keyToIndices.GetEnumerator()) {
+        $indices = $entry.Value
+        $tools = @($indices | ForEach-Object { $AllFindings[$_].Tool } | Select-Object -Unique)
+        if ($tools.Count -gt 1) {
+            foreach ($fidx in $indices) {
+                $otherTools = @($tools | Where-Object { $_ -ne $AllFindings[$fidx].Tool })
+                if ($otherTools.Count -gt 0) {
+                    if (-not $dupeMap[$fidx]) { $dupeMap[$fidx] = [System.Collections.ArrayList]::new() }
+                    foreach ($ot in $otherTools) {
+                        if ($dupeMap[$fidx] -notcontains $ot) {
+                            $dupeMap[$fidx].Add($ot) | Out-Null
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return $dupeMap
+}
+
+# --- HTML Report Builder ---
+
+function Build-HtmlReport {
+    param(
+        [array]$Findings,
+        [array]$ToolMeta,
+        [hashtable]$RawOutputs,
+        [hashtable]$Stats,
+        [hashtable]$DupeMap
+    )
+
+    $sb = [System.Text.StringBuilder]::new(262144)
+
+    $scanDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $hostName = ConvertTo-HtmlSafe $env:COMPUTERNAME
+    $userName = ConvertTo-HtmlSafe $env:USERNAME
+    $osInfo = try { ConvertTo-HtmlSafe (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption } catch { "Unknown" }
+    $elapsed = if ($Script:StartTime) {
+        $ts = (Get-Date) - $Script:StartTime
+        "{0:D2}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
+    } else { "N/A" }
+    $totalFindings = $Findings.Count
+
+    # Compute donut chart degrees
+    $total = [math]::Max($Stats.CRITICAL + $Stats.HIGH + $Stats.MEDIUM + $Stats.LOW + $Stats.INFO, 1)
+    $d1 = [math]::Round(($Stats.CRITICAL / $total) * 360, 1)
+    $d2 = $d1 + [math]::Round(($Stats.HIGH / $total) * 360, 1)
+    $d3 = $d2 + [math]::Round(($Stats.MEDIUM / $total) * 360, 1)
+    $d4 = $d3 + [math]::Round(($Stats.LOW / $total) * 360, 1)
+
+    # HTML Head + CSS
+    $sb.AppendLine(@"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security Recon Report - $hostName - $(Get-Date -Format 'yyyy-MM-dd')</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f1f5f9;color:#1e293b;line-height:1.6}
+.header{background:linear-gradient(135deg,#1e293b,#334155);color:#fff;padding:30px 40px}
+.header h1{font-size:24px;margin-bottom:8px}
+.header .meta{font-size:13px;color:#94a3b8}
+.header .meta span{margin-right:20px}
+.container{max-width:1200px;margin:0 auto;padding:20px}
+.stats-row{display:flex;gap:16px;margin-bottom:24px;flex-wrap:wrap}
+.stat-card{flex:1;min-width:100px;background:#fff;border-radius:8px;padding:16px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.stat-card .count{font-size:28px;font-weight:700}
+.stat-card .label{font-size:12px;text-transform:uppercase;color:#64748b;margin-top:4px}
+.stat-card.critical .count{color:#dc2626}
+.stat-card.high .count{color:#ea580c}
+.stat-card.medium .count{color:#ca8a04}
+.stat-card.low .count{color:#2563eb}
+.stat-card.info .count{color:#6b7280}
+.stat-card.total .count{color:#1e293b}
+.donut-row{display:flex;align-items:center;justify-content:center;margin-bottom:24px;gap:30px;flex-wrap:wrap}
+.donut{width:160px;height:160px;border-radius:50%;position:relative}
+.donut-hole{position:absolute;top:25%;left:25%;width:50%;height:50%;border-radius:50%;background:#f1f5f9;display:flex;align-items:center;justify-content:center;flex-direction:column}
+.donut-hole .num{font-size:24px;font-weight:700}
+.donut-hole .txt{font-size:11px;color:#64748b}
+.legend{display:flex;flex-direction:column;gap:6px}
+.legend-item{display:flex;align-items:center;gap:8px;font-size:13px}
+.legend-dot{width:12px;height:12px;border-radius:3px;flex-shrink:0}
+.filter-bar{background:#fff;border-radius:8px;padding:16px;margin-bottom:24px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.filter-btn{padding:6px 14px;border-radius:20px;border:2px solid;cursor:pointer;font-size:12px;font-weight:600;transition:all .2s;background:#fff}
+.filter-btn.active{color:#fff!important}
+.filter-btn.critical{border-color:#dc2626;color:#dc2626}.filter-btn.critical.active{background:#dc2626}
+.filter-btn.high{border-color:#ea580c;color:#ea580c}.filter-btn.high.active{background:#ea580c}
+.filter-btn.medium{border-color:#ca8a04;color:#ca8a04}.filter-btn.medium.active{background:#ca8a04}
+.filter-btn.low{border-color:#2563eb;color:#2563eb}.filter-btn.low.active{background:#2563eb}
+.filter-btn.info{border-color:#6b7280;color:#6b7280}.filter-btn.info.active{background:#6b7280}
+.search-input{flex:1;min-width:200px;padding:8px 14px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;outline:none}
+.search-input:focus{border-color:#3b82f6;box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+.tool-select{padding:7px 12px;border:1px solid #e2e8f0;border-radius:8px;font-size:13px;outline:none;background:#fff}
+.filter-info{font-size:12px;color:#64748b;margin-left:auto}
+.finding-card{background:#fff;border-radius:8px;margin-bottom:8px;border-left:4px solid #6b7280;box-shadow:0 1px 2px rgba(0,0,0,.06);overflow:hidden}
+.finding-card.critical{border-left-color:#dc2626}
+.finding-card.high{border-left-color:#ea580c}
+.finding-card.medium{border-left-color:#ca8a04}
+.finding-card.low{border-left-color:#2563eb}
+.finding-card.info{border-left-color:#6b7280}
+.finding-header{padding:12px 16px;cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none}
+.finding-header:hover{background:#f8fafc}
+.sev-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;color:#fff;min-width:70px;text-align:center}
+.sev-badge.critical{background:#dc2626}.sev-badge.high{background:#ea580c}.sev-badge.medium{background:#ca8a04}
+.sev-badge.low{background:#2563eb}.sev-badge.info{background:#6b7280}
+.f-tool{font-size:11px;color:#64748b;background:#f1f5f9;padding:2px 8px;border-radius:4px}
+.f-cat{font-size:11px;color:#64748b}
+.f-title{flex:1;font-size:13px;font-weight:500;overflow:hidden;text-overflow:ellipsis}
+.dupe-badge{font-size:10px;background:#dbeafe;color:#1d4ed8;padding:2px 6px;border-radius:10px;white-space:nowrap}
+.expand-icon{font-size:16px;color:#94a3b8;font-weight:700;width:20px;text-align:center}
+.finding-detail{padding:0 16px 16px 16px}
+.finding-detail pre{background:#1e293b;color:#e2e8f0;padding:16px;border-radius:6px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-wrap:break-word;max-height:400px;overflow-y:auto;font-family:'Cascadia Code','Fira Code',Consolas,monospace;line-height:1.4}
+.section-title{font-size:18px;font-weight:600;margin:30px 0 16px;color:#1e293b;display:flex;align-items:center;gap:8px}
+.section-title .cnt{font-size:13px;background:#e2e8f0;color:#475569;padding:2px 10px;border-radius:12px}
+.tool-status-bar{display:flex;gap:8px;margin-bottom:24px;flex-wrap:wrap}
+.tool-chip{padding:6px 12px;border-radius:6px;font-size:12px;font-weight:500}
+.tool-chip.ok{background:#dcfce7;color:#166534}
+.tool-chip.fail{background:#fee2e2;color:#991b1b}
+.tool-chip.timeout{background:#fee2e2;color:#991b1b}
+.tool-chip.skip{background:#e0e7ff;color:#3730a3}
+.tool-chip.pending{background:#f1f5f9;color:#64748b}
+.raw-section{margin-bottom:12px}
+.raw-toggle{background:#fff;width:100%;padding:12px 16px;border:1px solid #e2e8f0;border-radius:8px;cursor:pointer;text-align:left;font-size:13px;font-weight:500;display:flex;justify-content:space-between;align-items:center}
+.raw-toggle:hover{background:#f8fafc}
+.raw-content{background:#1e293b;color:#e2e8f0;padding:16px;border-radius:0 0 8px 8px;font-size:11px;font-family:'Cascadia Code','Fira Code',Consolas,monospace;white-space:pre-wrap;word-wrap:break-word;max-height:500px;overflow-y:auto;line-height:1.4}
+.exec-summary{background:#fff;border-radius:8px;padding:20px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.exec-summary h3{margin-bottom:12px;font-size:16px}
+.exec-item{padding:8px 0;border-bottom:1px solid #f1f5f9;display:flex;align-items:center;gap:10px;font-size:13px}
+.exec-item:last-child{border-bottom:none}
+.footer{text-align:center;padding:30px;color:#94a3b8;font-size:12px}
+@media print{.filter-bar{display:none}.finding-detail{display:block!important}.finding-card{break-inside:avoid}}
+@media(max-width:768px){.header{padding:20px}.stats-row{gap:8px}.stat-card{min-width:80px;padding:10px}.stat-card .count{font-size:20px}}
+</style>
+</head>
+<body>
+"@) | Out-Null
+
+    # Header
+    $sb.AppendLine(@"
+<div class="header">
+<h1>Windows Security Recon Report</h1>
+<div class="meta">
+<span>Host: <strong>$hostName</strong></span>
+<span>User: <strong>$userName</strong></span>
+<span>OS: $osInfo</span>
+<span>Date: $scanDate</span>
+<span>Duration: $elapsed</span>
+</div>
+</div>
+<div class="container">
+"@) | Out-Null
+
+    # Tool status bar
+    $sb.AppendLine('<div class="tool-status-bar">') | Out-Null
+    foreach ($tm in $ToolMeta) {
+        $statusClass = switch ($tm.Status) {
+            "OK"      { "ok" }
+            "FAIL"    { "fail" }
+            "TIMEOUT" { "timeout" }
+            "SKIP"    { "skip" }
+            default   { "pending" }
+        }
+        $statusText = "$($tm.Name): $($tm.Status)"
+        if ($tm.Duration -gt 0) { $statusText += " ($([math]::Round($tm.Duration, 1))s)" }
+        if ($tm.Error) { $statusText += " - $(ConvertTo-HtmlSafe $tm.Error)" }
+        $sb.AppendLine("<span class=`"tool-chip $statusClass`">$(ConvertTo-HtmlSafe $statusText)</span>") | Out-Null
+    }
+    $sb.AppendLine('</div>') | Out-Null
+
+    # Stats row
+    $sb.AppendLine(@"
+<div class="stats-row">
+<div class="stat-card critical"><div class="count">$($Stats.CRITICAL)</div><div class="label">Critical</div></div>
+<div class="stat-card high"><div class="count">$($Stats.HIGH)</div><div class="label">High</div></div>
+<div class="stat-card medium"><div class="count">$($Stats.MEDIUM)</div><div class="label">Medium</div></div>
+<div class="stat-card low"><div class="count">$($Stats.LOW)</div><div class="label">Low</div></div>
+<div class="stat-card info"><div class="count">$($Stats.INFO)</div><div class="label">Info</div></div>
+<div class="stat-card total"><div class="count">$totalFindings</div><div class="label">Total</div></div>
+</div>
+"@) | Out-Null
+
+    # Donut chart
+    $conicGrad = "conic-gradient(#dc2626 0deg ${d1}deg,#ea580c ${d1}deg ${d2}deg,#ca8a04 ${d2}deg ${d3}deg,#2563eb ${d3}deg ${d4}deg,#6b7280 ${d4}deg 360deg)"
+    $sb.AppendLine(@"
+<div class="donut-row">
+<div class="donut" style="background:$conicGrad">
+<div class="donut-hole"><span class="num">$totalFindings</span><span class="txt">findings</span></div>
+</div>
+<div class="legend">
+<div class="legend-item"><span class="legend-dot" style="background:#dc2626"></span>Critical ($($Stats.CRITICAL))</div>
+<div class="legend-item"><span class="legend-dot" style="background:#ea580c"></span>High ($($Stats.HIGH))</div>
+<div class="legend-item"><span class="legend-dot" style="background:#ca8a04"></span>Medium ($($Stats.MEDIUM))</div>
+<div class="legend-item"><span class="legend-dot" style="background:#2563eb"></span>Low ($($Stats.LOW))</div>
+<div class="legend-item"><span class="legend-dot" style="background:#6b7280"></span>Info ($($Stats.INFO))</div>
+</div>
+</div>
+"@) | Out-Null
+
+    # Filter bar
+    $toolOptions = ($ToolMeta | ForEach-Object { "<option value=`"$(ConvertTo-HtmlSafe $_.Name)`">$(ConvertTo-HtmlSafe $_.Name)</option>" }) -join ""
+    $sb.AppendLine(@"
+<div class="filter-bar">
+<button class="filter-btn critical active" data-filter="CRITICAL" onclick="toggleSev(this)">Critical ($($Stats.CRITICAL))</button>
+<button class="filter-btn high active" data-filter="HIGH" onclick="toggleSev(this)">High ($($Stats.HIGH))</button>
+<button class="filter-btn medium active" data-filter="MEDIUM" onclick="toggleSev(this)">Medium ($($Stats.MEDIUM))</button>
+<button class="filter-btn low active" data-filter="LOW" onclick="toggleSev(this)">Low ($($Stats.LOW))</button>
+<button class="filter-btn info active" data-filter="INFO" onclick="toggleSev(this)">Info ($($Stats.INFO))</button>
+<select class="tool-select" onchange="applyFilters()"><option value="all">All Tools</option>$toolOptions</select>
+<input class="search-input" type="text" placeholder="Search findings..." oninput="applyFilters()">
+<span class="filter-info" id="visibleCount">Showing $totalFindings of $totalFindings</span>
+</div>
+"@) | Out-Null
+
+    # Executive Summary (top 10 non-INFO findings by severity)
+    $sevOrder = @{ "CRITICAL" = 0; "HIGH" = 1; "MEDIUM" = 2; "LOW" = 3; "INFO" = 4 }
+    $topFindings = @($Findings | Where-Object { $_.Severity -ne "INFO" } |
+        Sort-Object { $sevOrder[$_.Severity] } | Select-Object -First 10)
+
+    if ($topFindings.Count -gt 0) {
+        $sb.AppendLine('<div class="exec-summary"><h3>Executive Summary - Top Findings</h3>') | Out-Null
+        foreach ($tf in $topFindings) {
+            $sevLower = $tf.Severity.ToLower()
+            $safeTitle = ConvertTo-HtmlSafe $tf.Title
+            $safeTool = ConvertTo-HtmlSafe $tf.Tool
+            $sb.AppendLine(@"
+<div class="exec-item">
+<span class="sev-badge $sevLower">$($tf.Severity)</span>
+<span class="f-tool">$safeTool</span>
+<span>$safeTitle</span>
+</div>
+"@) | Out-Null
+        }
+        $sb.AppendLine('</div>') | Out-Null
+    }
+
+    # Findings section
+    $sb.AppendLine("<div class=`"section-title`">All Findings <span class=`"cnt`">$totalFindings</span></div>") | Out-Null
+
+    for ($fi = 0; $fi -lt $Findings.Count; $fi++) {
+        $f = $Findings[$fi]
+        $sevLower = $f.Severity.ToLower()
+        $safeTitle = ConvertTo-HtmlSafe $f.Title
+        $safeDetails = ConvertTo-HtmlSafe $f.Details
+        $safeTool = ConvertTo-HtmlSafe $f.Tool
+        $safeCat = ConvertTo-HtmlSafe $f.Category
+
+        $dupeBadge = ""
+        if ($DupeMap -and $DupeMap.ContainsKey($fi)) {
+            $otherTools = ($DupeMap[$fi] | ForEach-Object { ConvertTo-HtmlSafe $_ }) -join ", "
+            $dupeBadge = "<span class=`"dupe-badge`" title=`"Also found by: $otherTools`">+$($DupeMap[$fi].Count) tools</span>"
+        }
+
+        $sb.AppendLine(@"
+<div class="finding-card $sevLower" data-severity="$($f.Severity)" data-tool="$safeTool" data-category="$safeCat">
+<div class="finding-header" onclick="toggleDetail(this)">
+<span class="sev-badge $sevLower">$($f.Severity)</span>
+<span class="f-tool">$safeTool</span>
+<span class="f-cat">$safeCat</span>
+<span class="f-title">$safeTitle</span>
+$dupeBadge
+<span class="expand-icon">+</span>
+</div>
+<div class="finding-detail" style="display:none"><pre>$safeDetails</pre></div>
+</div>
+"@) | Out-Null
+    }
+
+    # Raw Tool Output sections
+    $sb.AppendLine('<div class="section-title">Raw Tool Output</div>') | Out-Null
+
+    foreach ($tm in $ToolMeta) {
+        $toolName = $tm.Name
+        $rawContent = if ($RawOutputs -and $RawOutputs.ContainsKey($toolName)) { $RawOutputs[$toolName] } else { $null }
+        $safeToolName = ConvertTo-HtmlSafe $toolName
+        $rawId = "raw_$($toolName -replace '\W', '')"
+
+        if ($rawContent) {
+            $safeRaw = ConvertTo-HtmlSafe $rawContent
+            $sizeStr = if ($rawContent.Length -ge 1MB) { "$([math]::Round($rawContent.Length/1MB, 1)) MB" } else { "$([math]::Round($rawContent.Length/1KB, 0)) KB" }
+            $sb.AppendLine(@"
+<div class="raw-section">
+<button class="raw-toggle" onclick="toggleRaw('$rawId')">
+<span>$safeToolName ($sizeStr)</span><span id="${rawId}_icon">+</span>
+</button>
+<div class="raw-content" id="$rawId" style="display:none">$safeRaw</div>
+</div>
+"@) | Out-Null
+        } else {
+            $errMsg = if ($tm.Error) { ConvertTo-HtmlSafe $tm.Error } else { "No output" }
+            $sb.AppendLine(@"
+<div class="raw-section">
+<button class="raw-toggle" style="opacity:0.5;cursor:default">
+<span>$safeToolName - $($tm.Status): $errMsg</span><span></span>
+</button>
+</div>
+"@) | Out-Null
+        }
+    }
+
+    # Footer + JavaScript
+    $sb.AppendLine(@"
+<div class="footer">
+Generated by Windows Automated Security Reconnaissance | $scanDate | $hostName
+</div>
+</div>
+
+<script>
+function toggleDetail(header){
+    var d=header.nextElementSibling;
+    var icon=header.querySelector('.expand-icon');
+    if(d.style.display==='none'){d.style.display='';icon.textContent='-';}
+    else{d.style.display='none';icon.textContent='+';}
+}
+function toggleRaw(id){
+    var el=document.getElementById(id);
+    var icon=document.getElementById(id+'_icon');
+    if(el.style.display==='none'){el.style.display='';if(icon)icon.textContent='-';}
+    else{el.style.display='none';if(icon)icon.textContent='+';}
+}
+function toggleSev(btn){
+    btn.classList.toggle('active');
+    applyFilters();
+}
+function applyFilters(){
+    var activeSevs=[];
+    document.querySelectorAll('.filter-btn').forEach(function(b){
+        if(b.classList.contains('active'))activeSevs.push(b.getAttribute('data-filter'));
+    });
+    var toolFilter=document.querySelector('.tool-select').value;
+    var searchVal=document.querySelector('.search-input').value.toLowerCase();
+    var cards=document.querySelectorAll('.finding-card');
+    var visible=0;
+    cards.forEach(function(card){
+        var sevMatch=activeSevs.indexOf(card.getAttribute('data-severity'))!==-1;
+        var toolMatch=(toolFilter==='all'||card.getAttribute('data-tool')===toolFilter);
+        var searchMatch=(!searchVal||card.textContent.toLowerCase().indexOf(searchVal)!==-1);
+        if(sevMatch&&toolMatch&&searchMatch){card.style.display='';visible++;}
+        else{card.style.display='none';}
+    });
+    document.getElementById('visibleCount').textContent='Showing '+visible+' of '+$totalFindings;
+}
+</script>
+</body>
+</html>
+"@) | Out-Null
+
+    return $sb.ToString()
+}
+
+# --- Report Orchestrator ---
+
+function New-ConsolidatedHtmlReport {
+    $reportPath = Join-Path $Script:OutputDir $HtmlReportFileName
+
+    $allFindings = [System.Collections.ArrayList]::new()
+    $toolMeta = [System.Collections.ArrayList]::new()
+    $rawOutputs = @{}
+
+    foreach ($tool in $Script:EnabledTools) {
+        $toolName = $tool.Name
+        $tr = $Script:ToolResults[$toolName]
+        $outputFile = Join-Path $Script:OutputDir "$toolName-output.txt"
+
+        $meta = @{
+            Name         = $toolName
+            Status       = $tr.Status
+            Duration     = $tr.Duration
+            Size         = $tr.OutputSize
+            Error        = $tr.Error
+            FindingCount = 0
+        }
+
+        $shouldParse = ($tr.Status -eq "OK") -or ($tr.Status -eq "TIMEOUT")
+
+        if ($shouldParse -and (Test-Path $outputFile -ErrorAction SilentlyContinue)) {
+            $rawOutput = Get-Content -Path $outputFile -Raw -ErrorAction SilentlyContinue
+            $rawOutputs[$toolName] = $rawOutput
+
+            if ($rawOutput -and $rawOutput.Trim().Length -gt 0) {
+                try {
+                    $findings = ConvertFrom-ToolOutput -ToolName $toolName -RawOutput $rawOutput
+
+                    if ($tr.Status -eq "TIMEOUT") {
+                        foreach ($f in $findings) {
+                            $f.Title = "[PARTIAL] $($f.Title)"
+                        }
+                    }
+
+                    $meta.FindingCount = $findings.Count
+
+                    # Line coverage safety net
+                    $unparsedLines = Test-FindingLineCoverage -RawOutput $rawOutput -Findings $findings
+                    if ($unparsedLines -and $unparsedLines.Count -gt 0) {
+                        $unparsedText = $unparsedLines -join "`n"
+                        $unparsedSev = Get-SeverityFromKeywords -Text $unparsedText
+                        $allFindings.Add(@{
+                            Tool     = $toolName
+                            Category = "Unclassified"
+                            Severity = $unparsedSev
+                            Title    = "$toolName - Unclassified output ($($unparsedLines.Count) lines)"
+                            Details  = $unparsedText
+                            RawLines = $unparsedLines
+                        }) | Out-Null
+                    }
+
+                    foreach ($f in $findings) {
+                        $allFindings.Add($f) | Out-Null
+                    }
+
+                    Write-Log "Parsed $toolName: $($findings.Count) findings, $($unparsedLines.Count) unclassified lines"
+                } catch {
+                    Write-Log "Failed to parse $toolName output: $($_.Exception.Message)" -Level "WARN"
+                    $allFindings.Add(@{
+                        Tool = $toolName; Category = "Parse Error"; Severity = "INFO"
+                        Title = "$toolName - Parse error (raw output preserved below)"
+                        Details = "Parser error: $($_.Exception.Message)"
+                        RawLines = @()
+                    }) | Out-Null
+                }
+            }
+        } else {
+            $rawOutputs[$toolName] = $null
+        }
+
+        $toolMeta.Add($meta) | Out-Null
+    }
+
+    # Cross-tool deduplication hints
+    $dupeMap = Find-DuplicateFindings -AllFindings $allFindings.ToArray()
+
+    # Severity statistics
+    $stats = @{
+        CRITICAL = @($allFindings | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+        HIGH     = @($allFindings | Where-Object { $_.Severity -eq "HIGH" }).Count
+        MEDIUM   = @($allFindings | Where-Object { $_.Severity -eq "MEDIUM" }).Count
+        LOW      = @($allFindings | Where-Object { $_.Severity -eq "LOW" }).Count
+        INFO     = @($allFindings | Where-Object { $_.Severity -eq "INFO" }).Count
+    }
+
+    # Sort findings by severity (CRITICAL first)
+    $sevOrder = @{ "CRITICAL" = 0; "HIGH" = 1; "MEDIUM" = 2; "LOW" = 3; "INFO" = 4 }
+    $sortedFindings = @($allFindings | Sort-Object { $sevOrder[$_.Severity] })
+
+    # Build HTML
+    $html = Build-HtmlReport -Findings $sortedFindings -ToolMeta $toolMeta.ToArray() `
+        -RawOutputs $rawOutputs -Stats $stats -DupeMap $dupeMap
+
+    # Write file
+    [System.IO.File]::WriteAllText($reportPath, $html, [System.Text.Encoding]::UTF8)
+
+    Write-Log "HTML report written: $reportPath ($($html.Length) bytes, $($allFindings.Count) findings)"
+    return $reportPath
+}
+
+# ============================================================================
 # SECTION J: SUMMARY
 # ============================================================================
 
@@ -1081,6 +2026,9 @@ Tool Results:
     }
     $summaryContent += "`n`nResults: $okCount OK / $failCount Failed / $($Script:EnabledTools.Count) Total"
     $summaryContent += "`nOutput Directory: $($Script:OutputDir)"
+    if ($GenerateHtmlReport) {
+        $summaryContent += "`nHTML Report: $($Script:OutputDir)\$HtmlReportFileName"
+    }
     Set-Content -Path $summaryFile -Value $summaryContent -Encoding UTF8
     Write-Log "Summary written to $summaryFile"
 }
@@ -1327,6 +2275,25 @@ try {
     # Phase 3: Summary
     $Script:CurrentPhase = "SUMMARY"
     Show-Summary
+
+    # Phase 3.5: Consolidated HTML Report
+    if ($GenerateHtmlReport) {
+        $Script:CurrentPhase = "REPORT"
+        Show-Dashboard
+        Write-Host ""
+        Write-Host "  Generating consolidated HTML report..." -ForegroundColor DarkGray
+        try {
+            $htmlReportPath = New-ConsolidatedHtmlReport
+            Write-Host "  [OK]  " -ForegroundColor Green -NoNewline
+            Write-Host "HTML report: $htmlReportPath"
+            Write-Log "HTML report generated: $htmlReportPath"
+        } catch {
+            Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline
+            Write-Host "HTML report generation failed: $($_.Exception.Message)"
+            Write-Log "HTML report generation failed: $($_.Exception.Message)" -Level "ERROR"
+        }
+        Write-Host ""
+    }
 
 } finally {
     # Phase 4: Cleanup (ALWAYS runs, even on Ctrl+C)
