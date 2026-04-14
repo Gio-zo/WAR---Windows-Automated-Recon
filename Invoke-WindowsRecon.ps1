@@ -1336,15 +1336,15 @@ function ConvertFrom-WinPEASOutput {
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i].TrimEnd()
 
-        if ($line -match '[╔═╗╚╝╠╣║]{3,}[╣║]\s*(.+)') {
+        if ($line -match '[\u2550\u2554\u2557\u255A\u255D\u2560\u2563\u2551]{3,}[\u2563\u2551]\s*(.+)') {
             & $flushBlock
             $currentSection = $Matches[1].Trim()
             continue
         }
 
-        if ($line -match '^[\s═╔╗╚╝╠╣║▌▐─━\-=]{5,}$') {
+        if ($line -match '^[\s\u2500-\u257F\u2580-\u259F\-=]{5,}$') {
             & $flushBlock
-            if (($i + 1) -lt $lines.Count -and $lines[$i+1].Trim().Length -gt 2 -and $lines[$i+1] -notmatch '^[\s═╔╗╚╝╠╣║▌▐─━\-=]{5,}$') {
+            if (($i + 1) -lt $lines.Count -and $lines[$i+1].Trim().Length -gt 2 -and $lines[$i+1] -notmatch '^[\s\u2500-\u257F\u2580-\u259F\-=]{5,}$') {
                 $currentSection = $lines[$i+1].Trim()
             }
             continue
@@ -1679,7 +1679,7 @@ function Test-FindingLineCoverage {
     foreach ($line in $allLines) {
         $trimmed = $line.TrimEnd()
         if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
-        if ($trimmed -match '^[\s═╔╗╚╝╠╣║▌▐─━\-=\+\|\*]{4,}$') { continue }
+        if ($trimmed -match '^[\s\u2500-\u257F\u2580-\u259F\-=\+\|\*]{4,}$') { continue }
         if (-not $parsedLineSet.Contains($trimmed)) {
             $unparsed.Add($trimmed) | Out-Null
         }
