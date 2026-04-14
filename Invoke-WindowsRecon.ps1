@@ -2274,6 +2274,13 @@ try {
     # Banner
     Show-Banner
 
+    # Cleaner mode: skip recon, just clean everything
+    if ($Clean) {
+        Invoke-CleanerMode
+        $Script:ScriptCompleted = $true
+        return
+    }
+
     # Phase 0: Pre-flight checks
     $Script:CurrentPhase = "PRE-FLIGHT"
     Invoke-PreFlightChecks
@@ -2528,14 +2535,29 @@ try {
         Write-Host ""
     }
 
+    $Script:ScriptCompleted = $true
+
 } finally {
     # Phase 4: Cleanup (ALWAYS runs, even on Ctrl+C)
     $Script:CurrentPhase = "CLEANUP"
-    Write-Host ""
-    Write-Host "  Performing cleanup..." -ForegroundColor DarkGray
 
-    # Remove downloaded tools
+    # Skip cleanup if we were in cleaner mode (already handled)
+    if ($Clean) { return }
+
+    Write-Host ""
+    if (-not $Script:ScriptCompleted) {
+        Write-Host "  Script interrupted/failed - performing emergency cleanup..." -ForegroundColor Red
+    } else {
+        Write-Host "  Performing cleanup..." -ForegroundColor DarkGray
+    }
+
+    # Remove downloaded tools (temp bat files etc.)
     Remove-ReconTools
+
+    # If script didn't complete, also remove partial output
+    if (-not $Script:ScriptCompleted) {
+        Remove-PartialOutput
+    }
 
     # Remove forensic traces
     $cleanupResults = Remove-ForensicTraces
@@ -2543,7 +2565,19 @@ try {
     # Show cleanup report
     Show-CleanupReport -CleanupResults $cleanupResults
 
-    Write-Host "  Recon complete. Results saved to:" -ForegroundColor Green
-    Write-Host "  $($Script:OutputDir)" -ForegroundColor Cyan
+    if ($Script:ScriptCompleted) {
+        Write-Host "  Recon complete. Results saved to:" -ForegroundColor Green
+        Write-Host "  $($Script:OutputDir)" -ForegroundColor Cyan
+    } else {
+        if ($Script:OutputDir -and (Test-Path $Script:OutputDir -ErrorAction SilentlyContinue)) {
+            Write-Host "  Partial results may be at:" -ForegroundColor Yellow
+            Write-Host "  $($Script:OutputDir)" -ForegroundColor Yellow
+        } else {
+            Write-Host "  No output saved (cleaned up partial data)." -ForegroundColor Yellow
+        }
+        Write-Host ""
+        Write-Host "  To clean any remaining traces, run:" -ForegroundColor DarkGray
+        Write-Host "  .\Invoke-WindowsRecon.ps1 -Clean" -ForegroundColor Cyan
+    }
     Write-Host ""
 }
