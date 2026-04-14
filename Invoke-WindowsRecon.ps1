@@ -9,16 +9,28 @@
 
     Leaves zero trace on the machine after execution (no tools, minimal forensic artifacts).
 
+.PARAMETER Clean
+    Run in cleaner mode only. Skips all recon, removes any leftover artifacts from
+    previous runs (temp files, output dirs, prefetch, PS history, event logs).
+
 .NOTES
     AUTHORIZED USE ONLY - For blue team lab environments with proper authorization.
     Must be run as Administrator.
     Requires PowerShell 5.1+
 #>
 
+[CmdletBinding()]
+param(
+    [switch]$Clean
+)
+
 #Requires -Version 5.1
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Continue'
+
+# Also support environment variable for IEX usage: $env:RECON_CLEAN=1
+if ($env:RECON_CLEAN -eq '1') { $Clean = [switch]::Present }
 
 # ============================================================================
 # SECTION A: CONFIGURATION BLOCK (Edit this section to customize)
@@ -119,6 +131,7 @@ $Script:DashboardSupported = $true
 $Script:CurrentPhase = "INIT"
 $Script:EnabledTools = @()
 $Script:DashboardTop = 0
+$Script:ScriptCompleted = $false
 
 # ============================================================================
 # SECTION C: ASCII ART BANNER
@@ -813,6 +826,226 @@ function Invoke-ToolRunner {
 # ============================================================================
 # SECTION I: CLEANUP FUNCTIONS
 # ============================================================================
+
+function Remove-PartialOutput {
+    <#
+    .SYNOPSIS
+        Removes the output directory if the script didn't complete successfully.
+        Called on abort/Ctrl+C/failure to leave no partial data behind.
+    #>
+    if (-not $Script:OutputDir) { return }
+    if (-not (Test-Path $Script:OutputDir -ErrorAction SilentlyContinue)) { return }
+
+    try {
+        # Check if any tool actually completed
+        $anyOK = $false
+        foreach ($tr in $Script:ToolResults.Values) {
+            if ($tr.Status -eq "OK") { $anyOK = $true; break }
+        }
+
+        if (-not $anyOK) {
+            # No tools completed — nuke the entire output dir
+            Remove-Item -Path $Script:OutputDir -Recurse -Force -ErrorAction Stop
+            Write-Host "  [PASS] " -ForegroundColor Green -NoNewline
+            Write-Host "Removed partial output directory (no completed tools)"
+        } else {
+            Write-Host "  [INFO] " -ForegroundColor Cyan -NoNewline
+            Write-Host "Keeping output directory ($($Script:ToolResults.Values | Where-Object { $_.Status -eq 'OK' } | Measure-Object | Select-Object -ExpandProperty Count) tools completed)"
+        }
+    } catch {
+        Write-Host "  [WARN] " -ForegroundColor Yellow -NoNewline
+        Write-Host "Could not remove partial output: $($_.Exception.Message)"
+    }
+}
+
+function Invoke-CleanerMode {
+    <#
+    .SYNOPSIS
+        Standalone cleaner mode. Removes ALL artifacts from any previous recon runs.
+        Use when a previous run was interrupted and left files behind.
+    #>
+    Write-Host ""
+    Write-Host "  ============================================" -ForegroundColor Red
+    Write-Host "       CLEANER MODE - Removing All Traces" -ForegroundColor Red
+    Write-Host "  ============================================" -ForegroundColor Red
+    Write-Host ""
+
+    $cleanResults = @{}
+
+    # 1. Remove all ReconResults output directories
+    try {
+        $removed = 0
+        if (Test-Path $OutputBaseDir -ErrorAction SilentlyContinue) {
+            Get-ChildItem -Path $OutputBaseDir -Directory -Filter "Recon_*" -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                    $removed++
+                }
+            # Remove base dir if now empty
+            if ((Get-ChildItem $OutputBaseDir -ErrorAction SilentlyContinue | Measure-Object).Count -eq 0) {
+                Remove-Item $OutputBaseDir -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $cleanResults["Output directories"] = "Removed ($removed Recon_* folders)"
+    } catch {
+        $cleanResults["Output directories"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 2. Remove temp .cmd files (randomized bat tool names)
+    try {
+        $removed = 0
+        Get-ChildItem -Path $env:TEMP -Filter "*.cmd" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Length -gt 0 } |
+            ForEach-Object {
+                Remove-SecureFile -FilePath $_.FullName | Out-Null
+                $removed++
+            }
+        $cleanResults["Temp .cmd files"] = "Removed ($removed files)"
+    } catch {
+        $cleanResults["Temp .cmd files"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 3. Remove the script itself if it was downloaded to disk
+    try {
+        $scriptPath = $MyInvocation.ScriptName
+        if ($scriptPath -and (Test-Path $scriptPath) -and $scriptPath -match '(Invoke-WindowsRecon|Recon)') {
+            $cleanResults["Script file"] = "Found at $scriptPath (not auto-deleted - remove manually if needed)"
+        } else {
+            $cleanResults["Script file"] = "Not on disk (in-memory execution)"
+        }
+    } catch {
+        $cleanResults["Script file"] = "Check skipped"
+    }
+
+    # 4. Clear Prefetch entries for all tool names + this script
+    try {
+        $prefetchDir = "$env:SystemRoot\Prefetch"
+        $patterns = @("WINPEAS", "SEATBELT", "SHARPUP", "JAWS", "POWERUP", "POWERLESS", "PRIVESCCHECK", "INVOKE-WINDOWSRECON", "POWERSHELL")
+        $removed = 0
+        foreach ($pattern in $patterns) {
+            Get-ChildItem -Path $prefetchDir -Filter "*$pattern*" -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+                    $removed++
+                }
+        }
+        $cleanResults["Prefetch entries"] = "Removed ($removed entries)"
+    } catch {
+        $cleanResults["Prefetch entries"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 5. Clear PowerShell history of recon references
+    try {
+        $historyPath = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath
+        if ($historyPath -and (Test-Path $historyPath)) {
+            $filterPatterns = @(
+                "Invoke-WindowsRecon", "WinPEAS", "Seatbelt", "SharpUp", "JAWS",
+                "PowerUp", "Powerless", "PrivescCheck", "ReconResults", "RECON_CLEAN",
+                "recon-report", "DownloadString.*WindowsRecon"
+            )
+            $historyContent = Get-Content $historyPath -ErrorAction SilentlyContinue
+            if ($historyContent) {
+                $cleanedHistory = $historyContent | Where-Object {
+                    $line = $_
+                    $shouldRemove = $false
+                    foreach ($pattern in $filterPatterns) {
+                        if ($line -match [regex]::Escape($pattern)) { $shouldRemove = $true; break }
+                    }
+                    -not $shouldRemove
+                }
+                Set-Content -Path $historyPath -Value $cleanedHistory -Force
+                $diff = $historyContent.Count - $cleanedHistory.Count
+                $cleanResults["PS History"] = "Cleaned ($diff lines removed)"
+            } else {
+                $cleanResults["PS History"] = "Already clean"
+            }
+        } else {
+            $cleanResults["PS History"] = "Not found"
+        }
+    } catch {
+        $cleanResults["PS History"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 6. Clear PowerShell event logs
+    try {
+        wevtutil cl "Microsoft-Windows-PowerShell/Operational" 2>$null
+        $cleanResults["PS EventLog"] = "Cleared"
+    } catch {
+        $cleanResults["PS EventLog"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 7. Clear Defender detection/scan history
+    try {
+        $defenderPaths = @(
+            "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Service\DetectionHistory",
+            "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Results\Quick",
+            "$env:ProgramData\Microsoft\Windows Defender\Scans\History\Results\Resource"
+        )
+        $removed = 0
+        foreach ($dp in $defenderPaths) {
+            if (Test-Path $dp) {
+                Get-ChildItem -Path $dp -Recurse -ErrorAction SilentlyContinue |
+                    ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+            }
+        }
+        $cleanResults["Defender History"] = "Removed ($removed items)"
+    } catch {
+        $cleanResults["Defender History"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 8. Clear Zone.Identifier ADS from temp
+    try {
+        Get-ChildItem -Path $env:TEMP -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                Remove-Item "$($_.FullName):Zone.Identifier" -Force -ErrorAction SilentlyContinue
+            }
+        $cleanResults["Zone Identifiers"] = "Cleaned"
+    } catch {
+        $cleanResults["Zone Identifiers"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 9. Clear Recent Items referencing tools
+    try {
+        $recentPath = "$env:APPDATA\Microsoft\Windows\Recent"
+        $toolPatterns = @("WinPEAS", "Seatbelt", "SharpUp", "JAWS", "PowerUp", "Powerless", "PrivescCheck", "ReconResults", "recon-report")
+        $removed = 0
+        foreach ($pattern in $toolPatterns) {
+            Get-ChildItem -Path $recentPath -Filter "*$pattern*" -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; $removed++ }
+        }
+        $cleanResults["Recent Items"] = "Removed ($removed items)"
+    } catch {
+        $cleanResults["Recent Items"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # 10. Clear .NET assembly cache
+    try {
+        $cachePaths = @("$env:LOCALAPPDATA\assembly", "$env:SystemRoot\assembly\temp")
+        foreach ($cp in $cachePaths) {
+            if (Test-Path $cp) {
+                Get-ChildItem -Path $cp -Recurse -ErrorAction SilentlyContinue |
+                    ForEach-Object { Remove-Item $_.FullName -Force -Recurse -ErrorAction SilentlyContinue }
+            }
+        }
+        $cleanResults["Assembly Cache"] = "Cleaned"
+    } catch {
+        $cleanResults["Assembly Cache"] = "Failed: $($_.Exception.Message)"
+    }
+
+    # Report
+    Write-Host ""
+    Write-Host "  CLEANER REPORT" -ForegroundColor White
+    Write-Host "  ===============" -ForegroundColor DarkGray
+    foreach ($item in $cleanResults.GetEnumerator()) {
+        $icon = if ($item.Value -match "^(Removed|Cleaned|Cleared|Not found|Already clean|Not on disk)") { "[PASS]" } else { "[WARN]" }
+        $color = if ($icon -eq "[PASS]") { "Green" } else { "Yellow" }
+        Write-Host "  $icon " -ForegroundColor $color -NoNewline
+        Write-Host "$($item.Key): $($item.Value)"
+    }
+    Write-Host ""
+    Write-Host "  Cleaner mode complete. Machine should be clean." -ForegroundColor Green
+    Write-Host ""
+}
 
 function Remove-SecureFile {
     param([string]$FilePath)
